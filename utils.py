@@ -6,8 +6,12 @@ class DiffusionSchedule:
         T: int = 200,
         beta_start: float = 1e-4,
         beta_end: float = 0.02,
-        device="mps",
+        device="cpu",
     ):
+        if T < 1:
+            raise ValueError("T must be positive")
+        if not 0 < beta_start <= beta_end < 1:
+            raise ValueError("Expected 0 < beta_start <= beta_end < 1")
         self.T = T
         self.device = device
 
@@ -17,7 +21,7 @@ class DiffusionSchedule:
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
 
-        # 🔑 CRITICAL FOR MPS
+        # Clamp to keep square roots finite on supported devices, including MPS.
         alpha_bars = torch.clamp(alpha_bars, 1e-5, 1.0 - 1e-5)
 
         self.betas = betas

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import os
+import pickle
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
@@ -150,6 +154,7 @@ class DiffusionForImageChange(nn.Module):
         self.cfg = config
         self.size = config.image_size
         self.input_size = (config.in_ch, self.size[0], self.size[1])
+        self.diffusion_config = None
 
         self.time_mlp = TimeMLP(config.time_dim, config.time_dim)
 
@@ -290,7 +295,7 @@ class DiffusionForImageChange(nn.Module):
             _ = running / max(1, n)
 
     @torch.no_grad()
-    def denoise_data(self, x_t, t, model, alphas, alphas_cumprod, beta):
+    def denoise_data(self, x_t, t, model, alphas, alphas_cumprod, beta, generator=None):
         device = x_t.device
         b = x_t.shape[0]
         t = t.to(device, dtype=torch.long)
@@ -307,35 +312,81 @@ class DiffusionForImageChange(nn.Module):
 
         mean = (1.0 / torch.sqrt(a_t)) * (x_t - ((1.0 - a_t) / torch.sqrt(one_minus)) * eps_theta)
 
-        noise = torch.randn_like(x_t)
+        noise = torch.randn(x_t.shape, device=device, dtype=x_t.dtype, generator=generator)
         nonzero = (t != 0).float().view(b, 1, 1, 1)
         sigma = torch.sqrt(torch.clamp(b_t, 1e-6, 1.0))
 
         return mean + nonzero * sigma * noise
     
-    def save_model(model, optimizer, path: str, epoch: int | None = None):
+    @torch.no_grad()
+    def sample(self, schedule, n: int, *, generator=None):
+        """Run the reverse schedule; this does not assert sample quality."""
+        if n < 1:
+            raise ValueError("n must be positive")
+        parameter = next(self.parameters())
+        was_training = self.training
+        self.eval()
+        try:
+            x = torch.randn((n, *self.input_size), device=parameter.device,
+                            dtype=parameter.dtype, generator=generator)
+            for step in reversed(range(schedule.T)):
+                t = torch.full((n,), step, device=parameter.device, dtype=torch.long)
+                x = self.denoise_data(x, t, self, schedule.alphas,
+                                      schedule.alpha_bars, schedule.betas, generator)
+            return x
+        finally:
+            self.train(was_training)
+
+    def save_model(self, optimizer, path: str, epoch: int | None = None, *, diffusion_config=None):
+        """Atomically save tensors/primitive metadata; AdamW is the supported optimizer."""
+        if optimizer is not None and not isinstance(optimizer, torch.optim.AdamW):
+            raise ValueError("Checkpoint optimizer must be AdamW or None")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         state = {
-            "model_state": model.state_dict(),
+            "format_version": 1,
+            "model_state": self.state_dict(),
             "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
+            "optimizer_name": "AdamW" if optimizer is not None else None,
             "epoch": epoch,
-            "config": model.cfg,
+            "config": asdict(self.cfg),
+            "diffusion_config": diffusion_config or self.diffusion_config,
         }
-        torch.save(state, path)
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+        try:
+            torch.save(state, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
-    def load_model(path: str, device: str, optimizer=None):
-        ckpt = torch.load(path, map_location=device)
+    def load_model(path: str, device: str = "cpu", *, restore_optimizer: bool = True):
+        """Restore model and AdamW bound to its parameters using safe tensor loading.
 
-        model = DiffusionForImageChange(
-            size=ckpt["config"].image_size,
-            config=ckpt["config"],
-        ).to(device)
+        Legacy checkpoints containing pickled dataclasses must be regenerated.
+        Unrestricted pickle loading is deliberately unsupported.
+        """
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {path}")
+        try:
+            ckpt = torch.load(path, map_location=device, weights_only=True)
+        except pickle.UnpicklingError as error:
+            raise ValueError("Unsafe or legacy checkpoint format; regenerate it with this version. "
+                             "Unrestricted pickle loading is not supported.") from error
+        if not isinstance(ckpt, dict) or ckpt.get("format_version") != 1 or not isinstance(ckpt.get("config"), dict):
+            raise ValueError("Unsupported checkpoint format; expected version 1 with a configuration dictionary")
+        config = AlterNetUNetTinyConfig(**ckpt["config"])
+        model = DiffusionForImageChange(size=config.image_size, config=config).to(device)
         model.load_state_dict(ckpt["model_state"])
+        model.diffusion_config = ckpt.get("diffusion_config")
         model.eval()
-
-        if optimizer is not None and ckpt.get("optimizer_state") is not None:
+        optimizer = None
+        if restore_optimizer and ckpt.get("optimizer_state") is not None:
+            if ckpt.get("optimizer_name") != "AdamW":
+                raise ValueError("Unsupported checkpoint optimizer")
+            optimizer = torch.optim.AdamW(model.parameters())
             optimizer.load_state_dict(ckpt["optimizer_state"])
-
         epoch = ckpt.get("epoch", None)
         return model, optimizer, epoch
-
